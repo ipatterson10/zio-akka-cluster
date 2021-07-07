@@ -1,7 +1,9 @@
 package zio.akka.cluster
 
-import akka.actor.ActorSystem
+import akka.actor.typed.ActorSystem
+import akka.actor.typed.scaladsl.Behaviors
 import akka.cluster.ClusterEvent.MemberLeft
+import akka.cluster.typed.Leave
 import com.typesafe.config.{ Config, ConfigFactory }
 import zio.test.Assertion._
 import zio.test._
@@ -19,25 +21,30 @@ object ClusterSpec extends DefaultRunnableSpec {
                                                           |    provider = "cluster"
                                                           |  }
                                                           |  remote {
-                                                          |    netty.tcp {
+                                                          |    artery.canonical {
                                                           |      hostname = "127.0.0.1"
                                                           |      port = 2551
                                                           |    }
                                                           |  }
                                                           |  cluster {
-                                                          |    seed-nodes = ["akka.tcp://Test@127.0.0.1:2551"]
+                                                          |    seed-nodes = ["akka://Test@127.0.0.1:2551"]
                                                           |  }
                                                           |}
                   """.stripMargin)
 
-        val actorSystem: Managed[Throwable, ActorSystem] =
-          Managed.make(Task(ActorSystem("Test", config)))(sys => Task.fromFuture(_ => sys.terminate()).either)
+        val actorSystem: Managed[Throwable, ActorSystem[_]] =
+          Managed.make(Task(ActorSystem[Any](Behaviors.ignore, "Test", config)))(sys =>
+            Task.fromFuture(_ ⇒ sys.whenTerminated).unit.either
+          )
 
         assertM(
           for {
-            queue <- Cluster.clusterEvents()
-            _     <- Cluster.leave
-            item  <- queue.take
+            queue <- Cluster.clusterEvents
+            _      ← Cluster.leave
+            item  <- queue.filterOutput {
+                       case _: MemberLeft ⇒ true
+                       case _            => false
+                     }.take
           } yield item
         )(isSubtype[MemberLeft](anything)).provideLayer(ZLayer.fromManaged(actorSystem))
       }

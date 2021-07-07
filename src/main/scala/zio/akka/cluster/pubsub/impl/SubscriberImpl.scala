@@ -1,48 +1,66 @@
 package zio.akka.cluster.pubsub.impl
 
-import akka.actor.{ Actor, ActorRef, ActorSystem, PoisonPill, Props }
-import akka.cluster.pubsub.DistributedPubSubMediator.{ Subscribe, SubscribeAck }
+import akka.actor.typed.pubsub.Topic
+import akka.actor.typed.scaladsl.Behaviors
+import akka.actor.typed.{ ActorRef, ActorSystem, Behavior, PostStop }
 import zio.Exit.{ Failure, Success }
-import zio.akka.cluster.pubsub.impl.SubscriberImpl.SubscriberActor
-import zio.akka.cluster.pubsub.{ MessageEnvelope, Subscriber }
+import zio.akka.cluster.pubsub.Subscriber
 import zio.{ Promise, Queue, Runtime, Task }
 
+import scala.reflect.ClassTag
+
 private[pubsub] trait SubscriberImpl[A] extends Subscriber[A] {
-  val getActorSystem: ActorSystem
-  val getMediator: ActorRef
+  val actorSystem: ActorSystem[_]
+  implicit val tag: ClassTag[A]
 
   override def listenWith(topic: String, queue: Queue[A], group: Option[String] = None): Task[Unit] =
     for {
       rts        <- Task.runtime
       subscribed <- Promise.make[Nothing, Unit]
       _          <- Task(
-                      getActorSystem.actorOf(Props(new SubscriberActor[A](getMediator, topic, group, rts, queue, subscribed)))
+                      actorSystem.systemActorOf(SubscriberImpl(topic, queue, rts, subscribed), s"$topic-subscriber")
                     )
       _          <- subscribed.await
     } yield ()
 }
 
-object SubscriberImpl {
-  private[impl] class SubscriberActor[A](
-    mediator: ActorRef,
+private[impl] object SubscriberImpl {
+
+  sealed trait Message
+
+  case class Event[M](message: M) extends Message
+
+  case object Stop extends Message
+  type Stop = Stop.type
+
+  def apply[A: ClassTag](
     topic: String,
-    group: Option[String],
-    rts: Runtime[Any],
     queue: Queue[A],
+    rts: Runtime[Any],
     subscribed: Promise[Nothing, Unit]
-  ) extends Actor {
-
-    mediator ! Subscribe(topic, group, self)
-
-    def receive: PartialFunction[Any, Unit] = {
-      case SubscribeAck(_)      =>
-        rts.unsafeRunSync(subscribed.succeed(()))
-        ()
-      case MessageEnvelope(msg) =>
-        rts.unsafeRunAsync(queue.offer(msg.asInstanceOf[A])) {
-          case Success(_)     => ()
-          case Failure(cause) => if (cause.interrupted) self ! PoisonPill // stop listening if the queue was shut down
+  ): Behavior[Message] =
+    Behaviors.setup { ctx ⇒
+      val adapter: ActorRef[A]                 = ctx.messageAdapter[A](Event.apply)
+      val topicRef: ActorRef[Topic.Command[A]] = ctx.spawnAnonymous(Topic[A](topic))
+      topicRef ! Topic.subscribe(adapter)
+      rts.unsafeRun(subscribed.succeed(()))
+      Behaviors
+        .receiveMessage[Message] {
+          case Event(msg) ⇒
+            rts.unsafeRunAsync(queue.offer(msg.asInstanceOf[A])) {
+              case Success(_)     ⇒ ()
+              case Failure(cause) ⇒ if (cause.interrupted) ctx.self ! Stop else ()
+            }
+            Behaviors.same
+          case Stop       ⇒
+            Behaviors.stopped { () ⇒
+              topicRef ! Topic.unsubscribe(adapter)
+            }
+        }
+        .receiveSignal {
+          case (_, PostStop) =>
+            topicRef ! Topic.unsubscribe(adapter)
+            Behaviors.stopped[Message]
         }
     }
-  }
 }

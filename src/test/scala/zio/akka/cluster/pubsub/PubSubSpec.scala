@@ -1,6 +1,7 @@
 package zio.akka.cluster.pubsub
 
-import akka.actor.ActorSystem
+import akka.actor.typed.ActorSystem
+import akka.actor.typed.scaladsl.Behaviors
 import com.typesafe.config.{ Config, ConfigFactory }
 import zio.test.Assertion._
 import zio.test._
@@ -15,20 +16,22 @@ object PubSubSpec extends DefaultRunnableSpec {
                                                     |    provider = "cluster"
                                                     |  }
                                                     |  remote {
-                                                    |    netty.tcp {
+                                                    |    artery.canonical {
                                                     |      hostname = "127.0.0.1"
                                                     |      port = 2551
                                                     |    }
                                                     |  }
                                                     |  cluster {
-                                                    |    seed-nodes = ["akka.tcp://Test@127.0.0.1:2551"]
+                                                    |    seed-nodes = ["akka://Test@127.0.0.1:2551"]
                                                     |  }
                                                     |}
            """.stripMargin)
 
-  val actorSystem: ZLayer[Any, Throwable, Has[ActorSystem]] =
+  val actorSystem: ZLayer[Any, Throwable, Has[ActorSystem[_]]] =
     ZLayer.fromManaged(
-      Managed.make(Task(ActorSystem("Test", config)))(sys => Task.fromFuture(_ => sys.terminate()).either)
+      Managed.make(Task(ActorSystem[Any](Behaviors.ignore, "Test", config)))(sys =>
+        Task.fromFuture(_ ⇒ sys.whenTerminated).unit.either
+      )
     )
 
   val topic = "topic"
@@ -78,7 +81,7 @@ object PubSubSpec extends DefaultRunnableSpec {
             pubSub <- PubSub.createPubSub[String]
             queue1 <- pubSub.listen(topic, Some(group))
             queue2 <- pubSub.listen(topic, Some(group))
-            _      <- pubSub.publish(topic, msg, sendOneMessageToEachGroup = true)
+            _      <- pubSub.publish(topic, msg)
             item   <- queue1.take race queue2.take
             sizes  <- queue1.size zip queue2.size
           } yield (item, sizes)
@@ -92,7 +95,7 @@ object PubSubSpec extends DefaultRunnableSpec {
             pubSub <- PubSub.createPubSub[String]
             queue1 <- pubSub.listen(topic, Some(group1))
             queue2 <- pubSub.listen(topic, Some(group2))
-            _      <- pubSub.publish(topic, msg, sendOneMessageToEachGroup = true)
+            _      <- pubSub.publish(topic, msg)
             item1  <- queue1.take
             item2  <- queue2.take
           } yield List(item1, item2)
